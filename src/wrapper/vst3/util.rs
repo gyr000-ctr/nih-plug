@@ -19,6 +19,12 @@ pub const VST3_MIDI_PARAMS_START: u32 = VST3_MIDI_PARAMS_END - VST3_MIDI_NUM_PAR
 /// The (exclusive) end of the MIDI CC parameter range. Anything above this is reserved by the host.
 pub const VST3_MIDI_PARAMS_END: u32 = 1 << 31;
 
+/// The parameter ID used for the program change parameter that gets added when the plugin has any
+/// factory or user presets. This sits directly below the MIDI CC parameter range so it cannot
+/// collide with those. The wrapper asserts that none of the plugin's own parameter IDs collide
+/// with this ID either.
+pub const VST3_PROGRAM_CHANGE_PARAM_ID: u32 = VST3_MIDI_PARAMS_START - 1;
+
 /// Early exit out of a VST3 function when one of the passed pointers is null
 macro_rules! check_null_ptr {
     ($ptr:expr $(, $ptrs:expr)* $(, )?) => {

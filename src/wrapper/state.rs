@@ -9,6 +9,12 @@ use std::sync::Arc;
 use crate::params::ParamMut;
 use crate::prelude::{BufferConfig, Param, ParamPtr, Params, Plugin};
 
+/// The maximum size of a single plugin state blob in bytes, both when serializing and when
+/// deserializing. This puts an upper bound on the amount of memory loading or saving a single
+/// state (or preset) can take. 64 MiB should be more than enough for any reasonable plugin state,
+/// including embedded sample data.
+pub(crate) const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
+
 // These state objects are also exposed directly to the plugin so it can do its own internal preset
 // management
 
@@ -137,6 +143,12 @@ pub(crate) unsafe fn serialize_json<'a, P: Plugin>(
 ) -> Result<Vec<u8>> {
     let plugin_state = serialize_object::<P>(plugin_params, params_iter);
     let json = serde_json::to_vec(&plugin_state).context("Could not format as JSON")?;
+    if json.len() > MAX_STATE_BYTES {
+        anyhow::bail!(
+            "The plugin state is too large to save ({} bytes)",
+            json.len()
+        );
+    }
 
     #[cfg(feature = "zstd")]
     {
@@ -243,8 +255,19 @@ pub(crate) unsafe fn deserialize_object<P: Plugin>(
 /// `Plugin::reset()`, and this way all of that behavior can be encapsulated so it can be reused in
 /// multiple places. The returned state object can be passed to [`deserialize_object()`].
 pub(crate) unsafe fn deserialize_json(state: &[u8]) -> Option<PluginState> {
+    // Reject absurdly large states up front so a malformed or hostile state cannot cause huge
+    // allocations
+    if state.len() > MAX_STATE_BYTES {
+        nih_debug_assert_failure!(
+            "Refusing to deserialize a {} byte state, the maximum is {} bytes",
+            state.len(),
+            MAX_STATE_BYTES
+        );
+        return None;
+    }
+
     #[cfg(feature = "zstd")]
-    let result: Option<PluginState> = match zstd::decode_all(state) {
+    let result: Option<PluginState> = match decode_zstd_bounded(state) {
         Ok(decompressed) => match serde_json::from_slice(decompressed.as_slice()) {
             Ok(s) => {
                 let state_bytes = decompressed.len();
@@ -291,4 +314,25 @@ pub(crate) unsafe fn deserialize_json(state: &[u8]) -> Option<PluginState> {
     };
 
     result
+}
+
+/// Decompress a Zstandard-compressed state, refusing to decompress more than [`MAX_STATE_BYTES`]
+/// bytes so a small malicious input cannot expand into a huge allocation (a 'zip bomb').
+#[cfg(feature = "zstd")]
+fn decode_zstd_bounded(state: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let decoder = zstd::Decoder::new(state)?;
+    let mut decompressed = Vec::new();
+    decoder
+        .take(MAX_STATE_BYTES as u64 + 1)
+        .read_to_end(&mut decompressed)?;
+    if decompressed.len() > MAX_STATE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "The decompressed state exceeds the maximum state size",
+        ));
+    }
+
+    Ok(decompressed)
 }

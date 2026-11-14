@@ -3,7 +3,8 @@ use crossbeam::atomic::AtomicCell;
 use crossbeam::channel::{self, SendTimeoutError};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use vst3_sys::base::{kInvalidArgument, kResultOk, tresult};
@@ -12,7 +13,9 @@ use vst3_sys::vst::{IComponentHandler, RestartFlags};
 use super::context::{WrapperGuiContext, WrapperInitContext, WrapperProcessContext};
 use super::note_expressions::NoteExpressionController;
 use super::param_units::ParamUnits;
+use super::presets::{self, Preset, PresetLibrary, PresetOrigin};
 use super::util::{ObjectPtr, VstPtr, VST3_MIDI_PARAMS_END, VST3_MIDI_PARAMS_START};
+use super::util::VST3_PROGRAM_CHANGE_PARAM_ID;
 use super::view::WrapperView;
 use crate::event_loop::{EventLoop, MainThreadExecutor, OsEventLoop};
 use crate::prelude::{
@@ -119,6 +122,18 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// The receiver belonging to [`new_state_sender`][Self::new_state_sender].
     pub updated_state_receiver: channel::Receiver<PluginState>,
 
+    /// The factory and user presets discovered when the wrapper was created. Scanned once on the
+    /// main thread during initialization, so scanning never blocks the audio thread. Newly saved
+    /// user presets are appended to this list.
+    pub preset_library: RwLock<PresetLibrary>,
+    /// The index of the currently loaded preset in [`preset_library`][Self::preset_library], or -1
+    /// if no preset has been loaded (or the state has been modified or restored through other
+    /// means since then).
+    pub current_preset_index: AtomicI32,
+    /// Serializes concurrent preset save operations so two threads cannot write to the same preset
+    /// file at the same time.
+    pub preset_save_lock: Mutex<()>,
+
     /// The keys from `param_map` in a stable order.
     pub param_hashes: Vec<u32>,
     /// A mapping from parameter ID hashes (obtained from the string parameter IDs) to pointers to
@@ -154,6 +169,9 @@ pub enum Task<P: Plugin> {
     /// Trigger a restart with the given restart flags. This is a bit set of the flags from
     /// [`vst3_sys::vst::RestartFlags`].
     TriggerRestart(i32),
+    /// Load a preset from the preset library by its program list index. Preset files are always
+    /// read on the main thread, never from the audio thread.
+    LoadPreset(i32),
     /// Request the editor to be resized according to its current size. Right now there is no way to
     /// handle "denied resize" requests yet.
     RequestResize,
@@ -244,6 +262,14 @@ impl<P: Vst3Plugin> WrapperInner<P> {
                         id
                     );
                 }
+
+                nih_debug_assert_ne!(
+                    *hash,
+                    VST3_PROGRAM_CHANGE_PARAM_ID,
+                    "Parameter '{}' collides with the automatically generated program change \
+                     parameter, consider giving it a different ID",
+                    id
+                );
             }
         }
 
@@ -273,6 +299,15 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             .into_iter()
             .map(|(_, hash, ptr, _)| (ptr, hash))
             .collect();
+
+        // Scan the factory and user preset directories. This happens on the main thread when the
+        // plugin instance is created, and only involves listing directories (preset file contents
+        // are read lazily when a preset is loaded), so this is cheap. When no presets are found
+        // the wrapper behaves exactly as if this feature didn't exist.
+        let preset_library = PresetLibrary::scan(&presets::preset_directories::<P>());
+        if !preset_library.presets().is_empty() {
+            nih_trace!("Found {} presets", preset_library.presets().len());
+        }
 
         let wrapper = Arc::new(Self {
             plugin: Mutex::new(plugin),
@@ -311,6 +346,10 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             process_events: AtomicRefCell::new(Vec::with_capacity(4096)),
             updated_state_sender,
             updated_state_receiver,
+
+            preset_library: RwLock::new(preset_library),
+            current_preset_index: AtomicI32::new(-1),
+            preset_save_lock: Mutex::new(()),
 
             param_hashes,
             param_by_hash,
